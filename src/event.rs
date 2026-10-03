@@ -286,7 +286,7 @@ pub enum InputDiscardStatus {
     ControlSequenceInProgress,
 }
 
-/// Discard decoded events while preserving incomplete escape-sequence boundaries.
+/// Discard decoded input while preserving palette replies and incomplete escape boundaries.
 ///
 /// This does not flush the operating system's terminal input queue. Callers that need a clean
 /// input boundary should drain it through the event reader. If an incomplete bracketed paste or
@@ -1537,6 +1537,17 @@ pub(crate) enum InternalEvent {
     OperatingStatus,
     /// A DEC mode 2031 palette-change notification.
     ColorSchemeChanged,
+}
+
+impl InternalEvent {
+    /// Keep palette generations framed when an application quarantines user input.
+    #[cfg(unix)]
+    pub(crate) fn is_palette_response(&self) -> bool {
+        matches!(
+            self,
+            Self::OscColor { .. } | Self::OperatingStatus | Self::ColorSchemeChanged
+        )
+    }
 }
 
 /// Parsed payload of an OSC color response.

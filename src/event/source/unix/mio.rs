@@ -273,7 +273,8 @@ impl Parser {
             }
         }
         self.buffer.clear();
-        self.internal_events.clear();
+        self.internal_events
+            .retain(InternalEvent::is_palette_response);
         self.pending_escape_deadline = None;
         match self.discarded_sequence {
             Some(DiscardedSequence::PasteStart(_) | DiscardedSequence::PasteBody(_)) => {
@@ -488,6 +489,7 @@ mod tests {
     fn discarded_escape_suppresses_a_delayed_modifier_suffix() {
         for suffix in [b'y', b'1'] {
             let mut parser = Parser::default();
+            parser.advance(b"\x1b[0n", false);
             parser.buffer_external_input(b"\x1b");
             parser.pending_escape_deadline = Some(Instant::now());
 
@@ -496,6 +498,7 @@ mod tests {
                 InputDiscardStatus::BracketedPasteInProgress
             );
             assert_eq!(parser.finish_pending_escape(), None);
+            assert_eq!(parser.next(), Some(InternalEvent::OperatingStatus));
             parser.advance(std::slice::from_ref(&suffix), false);
 
             assert_eq!(parser.next(), None);
