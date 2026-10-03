@@ -130,6 +130,8 @@ pub(crate) mod timeout;
 use derive_more::derive::IsVariant;
 #[cfg(feature = "event-stream")]
 pub use stream::EventStream;
+#[cfg(feature = "event-stream")]
+pub use stream::{TerminalEvent, TerminalEventStream};
 
 use crate::event::{
     filter::{EventFilter, Filter},
@@ -1532,6 +1534,9 @@ pub(crate) enum InternalEvent {
     /// OSC color response (`slot`, `payload`).
     #[cfg(unix)]
     OscColor { slot: u8, payload: OscColorPayload },
+    /// A DEC mode 2031 palette-change notification.
+    #[cfg(unix)]
+    ColorSchemeChanged,
 }
 
 /// Parsed payload of an OSC color response.

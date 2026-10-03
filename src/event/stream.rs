@@ -14,7 +14,9 @@ use std::{
 use futures_core::stream::Stream;
 
 use crate::event::{
-    filter::EventFilter, lock_internal_event_reader, poll_internal, read_internal, sys::Waker,
+    filter::{EventFilter, Filter},
+    lock_internal_event_reader, poll_internal, read_internal,
+    sys::Waker,
     Event, InternalEvent,
 };
 
@@ -31,6 +33,7 @@ use crate::event::{
 /// it (`event-stream-*`).
 #[derive(Debug)]
 pub struct EventStream {
+    filter: StreamFilter,
     poll_internal_waker: Waker,
     stream_wake_task_executed: Arc<AtomicBool>,
     stream_wake_task_should_shutdown: Arc<AtomicBool>,
@@ -39,12 +42,18 @@ pub struct EventStream {
 
 impl Default for EventStream {
     fn default() -> Self {
+        Self::with_filter(StreamFilter::Input)
+    }
+}
+
+impl EventStream {
+    fn with_filter(filter: StreamFilter) -> Self {
         let (task_sender, receiver) = mpsc::sync_channel::<Task>(1);
 
         thread::spawn(move || {
             while let Ok(task) = receiver.recv() {
                 loop {
-                    if let Ok(true) = poll_internal(None, &EventFilter) {
+                    if let Ok(true) = poll_internal(None, &filter) {
                         break;
                     }
 
@@ -59,6 +68,7 @@ impl Default for EventStream {
         });
 
         EventStream {
+            filter,
             poll_internal_waker: lock_internal_event_reader().waker(),
             stream_wake_task_executed: Arc::new(AtomicBool::new(false)),
             stream_wake_task_should_shutdown: Arc::new(AtomicBool::new(false)),
@@ -102,13 +112,22 @@ impl Stream for EventStream {
     type Item = io::Result<Event>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = match poll_internal(Some(Duration::from_secs(0)), &EventFilter) {
-            Ok(true) => match read_internal(&EventFilter) {
-                Ok(InternalEvent::Event(event)) => Poll::Ready(Some(Ok(event))),
-                Err(e) => Poll::Ready(Some(Err(e))),
-                #[cfg(unix)]
-                _ => unreachable!(),
-            },
+        self.poll_internal_event(cx).map(|event| {
+            event.map(|event| {
+                event.map(|event| match event {
+                    InternalEvent::Event(event) => event,
+                    #[cfg(unix)]
+                    _ => unreachable!(),
+                })
+            })
+        })
+    }
+}
+
+impl EventStream {
+    fn poll_internal_event(&self, cx: &mut Context<'_>) -> Poll<Option<io::Result<InternalEvent>>> {
+        let result = match poll_internal(Some(Duration::from_secs(0)), &self.filter) {
+            Ok(true) => Poll::Ready(Some(read_internal(&self.filter))),
             Ok(false) => {
                 if !self
                     .stream_wake_task_executed
@@ -137,6 +156,84 @@ impl Stream for EventStream {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum StreamFilter {
+    Input,
+    Terminal,
+}
+
+impl Filter for StreamFilter {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        #[cfg(unix)]
+        if matches!(self, Self::Terminal)
+            && matches!(
+                event,
+                InternalEvent::OscColor { .. } | InternalEvent::ColorSchemeChanged
+            )
+        {
+            return true;
+        }
+        EventFilter.eval(event)
+    }
+}
+
+/// Input and terminal palette responses delivered by [`TerminalEventStream`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalEvent {
+    /// Ordinary keyboard, paste, mouse, focus, or resize input.
+    Input(Event),
+    /// An OSC color response. An unrecognized color is reported as `None`.
+    Color {
+        slot: u8,
+        color: Option<crate::style::Color>,
+    },
+    /// A DEC mode 2031 notification; query OSC 10/11 to obtain the new colors.
+    ColorSchemeChanged,
+}
+
+/// An opt-in event stream that delivers OSC color replies and DEC mode 2031 notifications.
+///
+/// Uses the same single input reader as [`EventStream`]. Applications can write color queries
+/// without waiting for a reply or blocking keyboard input. Do not use this concurrently with
+/// another event reader or the synchronous color-query helpers. Notifications must be enabled
+/// separately by the application; this stream does not change terminal modes.
+#[derive(Debug)]
+pub struct TerminalEventStream(EventStream);
+
+impl Default for TerminalEventStream {
+    fn default() -> Self {
+        Self(EventStream::with_filter(StreamFilter::Terminal))
+    }
+}
+
+impl Stream for TerminalEventStream {
+    type Item = io::Result<TerminalEvent>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.0.poll_internal_event(cx).map(|event| {
+            event.map(|event| {
+                event.map(|event| match event {
+                    InternalEvent::Event(event) => TerminalEvent::Input(event),
+                    #[cfg(unix)]
+                    InternalEvent::OscColor { slot, payload } => TerminalEvent::Color {
+                        slot,
+                        color: match payload {
+                            super::OscColorPayload::Rgb { r, g, b } => {
+                                Some(crate::style::Color::Rgb { r, g, b })
+                            }
+                            super::OscColorPayload::Unrecognized(_) => None,
+                        },
+                    },
+                    #[cfg(unix)]
+                    InternalEvent::ColorSchemeChanged => TerminalEvent::ColorSchemeChanged,
+                    #[cfg(unix)]
+                    _ => unreachable!(),
+                })
+            })
+        })
+    }
+}
+
 impl Drop for EventStream {
     fn drop(&mut self) {
         self.stream_wake_task_should_shutdown
@@ -144,3 +241,7 @@ impl Drop for EventStream {
         let _ = self.poll_internal_waker.wake();
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "stream_tests.rs"]
+mod tests;
